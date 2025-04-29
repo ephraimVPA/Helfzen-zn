@@ -1,98 +1,72 @@
-import { OAuth2Client } from "google-auth-library"
-import { findUserByEmail, addUserIfNotExists } from "./google-sheets-users"
+// ✅ lib/google-auth.ts (complete, child‑friendly version)
+// This file does TWO jobs:
+// 1. Build the Google login link (getGoogleAuthUrl)
+// 2. After Google sends us back, check the user (verifyGoogleToken)
 
-// Google OAuth client configuration
-export const googleClientId = process.env.GOOGLE_CLIENT_ID || ""
-export const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET || ""
-export const redirectUri = process.env.REDIRECT_URI || "http://localhost:3000/api/auth/google/callback"
+import { google } from "googleapis" // Google helper SDK
+import { OAuth2Client } from "google-auth-library" // Low‑level OAuth client
+import { findUserByEmail } from "./google-sheets-users" // Our sheet lookup
 
-// Create OAuth client
+// Grab secrets from .env (you will paste these there)
+const googleClientId = process.env.GOOGLE_CLIENT_ID!
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET!
+// Where Google should send the user back after login
+const redirectUri = process.env.REDIRECT_URI || "http://localhost:3000/api/auth/google/callback"
+
+// Set up the OAuth client once
 export const oAuth2Client = new OAuth2Client(googleClientId, googleClientSecret, redirectUri)
 
-// Log configuration on module load
-console.log("Google OAuth configuration:")
-console.log("- Client ID exists:", !!googleClientId)
-console.log("- Client Secret exists:", !!googleClientSecret)
-console.log("- Redirect URI:", redirectUri)
-
-// Generate Google OAuth URL
+// 🔗 1) Build the Google login URL that we send the user to
 export function getGoogleAuthUrl(state = "") {
-  console.log("Generating Google OAuth URL with state:", state)
+  const scopes = [
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+  ]
 
-  const scopes = ["https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]
-
-  const authUrl = oAuth2Client.generateAuthUrl({
+  return oAuth2Client.generateAuthUrl({
     access_type: "offline",
     scope: scopes,
     prompt: "consent",
-    state: state,
+    state, // we store our own callback URL inside state
   })
-
-  console.log("Generated auth URL:", authUrl)
-  return authUrl
 }
 
-// Verify Google token and get user info
+// ✅ 2) After Google returns with a CODE, swap it for the user’s profile
 export async function verifyGoogleToken(code: string) {
   try {
-    console.log("Verifying Google token...")
-
-    // Exchange code for tokens
-    console.log("Getting tokens with code...")
+    // A. Exchange code → tokens
     const { tokens } = await oAuth2Client.getToken(code)
-    console.log("Received tokens:", !!tokens.access_token, !!tokens.refresh_token)
-
     oAuth2Client.setCredentials(tokens)
 
-    // Get user info
-    console.log("Fetching user info...")
-    const userInfoResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-      headers: {
-        Authorization: `Bearer ${tokens.access_token}`,
-      },
-    })
+    // B. Pull the user’s profile (email, name, id)
+    const oauth2 = google.oauth2({ version: "v2", auth: oAuth2Client })
+    const { data } = await oauth2.userinfo.get()
 
-    if (!userInfoResponse.ok) {
-      console.error("Failed to fetch user info:", userInfoResponse.status, userInfoResponse.statusText)
-      throw new Error("Failed to fetch user info")
+    if (!data.email) {
+      console.error("Google profile came back without an email – cannot continue")
+      return null
     }
 
-    const userInfo = await userInfoResponse.json()
-    console.log("Received user info:", userInfo.email)
-
-    // Check if user exists in our sheet
-    console.log("Finding user in sheet:", userInfo.email)
-    let user = await findUserByEmail(userInfo.email)
-
-    if (!user) {
-      console.log(`User ${userInfo.email} not found in sheet, attempting to add`)
-      // Try to add the user to the sheet
-      user = await addUserIfNotExists(userInfo.email, userInfo.name || "")
-
-      if (!user) {
-        console.error("Failed to add user to sheet")
-        return null
-      }
-
-      console.log("Added new user to sheet")
+    // C. Check if this email is in our Google Sheet whitelist
+    const allowedUser = await findUserByEmail(data.email)
+    if (!allowedUser) {
+      // Not on the list → block
+      console.log(`User ${data.email} is NOT on the whitelist – access denied`)
+      return null
     }
 
-    // Return user info with additional data from our sheet
-    console.log("Returning user info for:", userInfo.email)
+    // D. Build the user object that our callback route will store in a JWT
     return {
-      id: userInfo.id,
-      email: userInfo.email,
-      name: userInfo.name || user.name,
-      picture: userInfo.picture,
-      role: user.role,
-      commentAccess: user.commentAccess.toUpperCase() === "TRUE",
+      id: data.id || "", // Google id can be undefined, fallback to empty
+      email: data.email,
+      name: data.name || "",
+      role: allowedUser.role,
+      commentAccess: allowedUser.commentAccess === "TRUE",
     }
-  } catch (error) {
-    console.error("Error verifying Google token:", error)
-    if (error instanceof Error) {
-      console.error("Error message:", error.message)
-      console.error("Error stack:", error.stack)
-    }
+  } catch (err) {
+    console.error("verifyGoogleToken failed:", err)
     return null
   }
 }
+
+// ➡️  Done!  The rest of the app calls getGoogleAuthUrl() and verifyGoogleToken()
