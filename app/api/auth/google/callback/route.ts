@@ -3,30 +3,44 @@ import { cookies } from "next/headers"
 import { verifyGoogleToken } from "@/lib/google-auth"
 import { SignJWT } from "jose"
 
+// Improved callback route with better error handling and logging
 export async function GET(request: NextRequest) {
   try {
-    const { searchParams, origin } = request.nextUrl
-    const code  = searchParams.get("code")
-    const state = searchParams.get("state") // our encoded callback
+    console.log("Google OAuth callback started")
 
-    // 1️⃣  Safety checks
+    // Get the authorization code from the URL
+    const searchParams = request.nextUrl.searchParams
+    const code = searchParams.get("code")
+    const callbackUrl = searchParams.get("state") || "/dashboard"
+
+    console.log("Callback URL:", callbackUrl)
+    console.log("Authorization code exists:", !!code)
+
     if (!code) {
+      console.error("Missing authorization code")
       return NextResponse.redirect(new URL("/login?error=missing_code", request.url))
     }
 
-    // 2️⃣  Exchange code ➜ user profile
+    // Verify the token and get user info
+    console.log("Verifying Google token...")
     const user = await verifyGoogleToken(code)
+
     if (!user) {
+      console.error("Failed to verify Google token or user not authorized")
       return NextResponse.redirect(new URL("/login?error=unauthorized", request.url))
     }
 
-    // 3️⃣  Build JWT for 7 days
-    const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "secret")
+    console.log("User authenticated successfully:", user.email)
+
+    // Create a JWT token using jose instead of jsonwebtoken
+    console.log("Creating JWT token...")
+    const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "your-secret-key")
+
     const token = await new SignJWT({
       userId: user.id,
-      email:  user.email,
-      name:   user.name,
-      role:   user.role,
+      email: user.email,
+      name: user.name,
+      role: user.role,
       commentAccess: user.commentAccess,
     })
       .setProtectedHeader({ alg: "HS256" })
@@ -34,22 +48,31 @@ export async function GET(request: NextRequest) {
       .setExpirationTime("7d")
       .sign(JWT_SECRET)
 
+    console.log("JWT token created")
+
+    // Set the token in a cookie
+    console.log("Setting auth-token cookie...")
     cookies().set("auth-token", token, {
       httpOnly: true,
-      secure:   process.env.NODE_ENV === "production",
+      secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
-      path:     "/",
-      maxAge:   60 * 60 * 24 * 7, // 7 days
+      maxAge: 7 * 24 * 60 * 60, // 7 days
+      path: "/",
     })
 
-    // 4️⃣  Decode the state (= callbackUrl) **once**
-    const decoded = state ? decodeURIComponent(state) : "/dashboard"
-    // If it’s a relative path like "/" ➜ make absolute
-    const finalUrl = decoded.startsWith("http") ? decoded : `${origin}${decoded}`
+    // Log the redirect
+    console.log("Redirecting to:", callbackUrl)
 
-    return NextResponse.redirect(finalUrl)
-  } catch (err) {
-    console.error("Google callback failed", err)
+    // Redirect to the callback URL or dashboard
+    return NextResponse.redirect(new URL(callbackUrl, request.url))
+  } catch (error) {
+    console.error("Error in Google callback:", error)
+    // More detailed error logging
+    if (error instanceof Error) {
+      console.error("Error message:", error.message)
+      console.error("Error stack:", error.stack)
+    }
+
     return NextResponse.redirect(new URL("/login?error=auth_error", request.url))
   }
 }
